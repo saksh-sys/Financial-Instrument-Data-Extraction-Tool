@@ -1,5 +1,5 @@
 # Saksham-Raj-Gupta_Data-Engineer
-Steeleye python assignment
+
 You need to install the required packages using pip. The required packages are boto3, requests, zipfile, and xml.etree.ElementTree.
 
 You need to set up AWS credentials in your environment, either as environment variables or by using the AWS CLI.

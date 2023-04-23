@@ -1,105 +1,82 @@
+import requests
+import zipfile
+import io
+import xml.etree.ElementTree as ET
+import csv
 import boto3
 import logging
 import os
-import requests
-import zipfile
-import csv
-import io
-import xml.etree.ElementTree as ET
 
 # Set up logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger()
+logging.basicConfig(filename='logfile.log', level=logging.DEBUG)
 
-# AWS S3 Configurations
-S3_BUCKET = os.environ['S3_BUCKET']
-S3_KEY = 'output.csv'
+# Set up S3 client
+s3 = boto3.client('s3')
 
-def download_extract_zip(download_url):
-    response = requests.get(download_url)
-    with open('temp.zip', 'wb') as f:
-        f.write(response.content)
-    with zipfile.ZipFile('temp.zip', 'r') as zip_ref:
-        zip_ref.extractall('.')
-    os.remove('temp.zip')
-    logger.info('Extracted contents of zip file.')
+def download_file(url):
+    """Downloads the file from the given URL and returns its content"""
+    try:
+        response = requests.get(url)
+        content = response.content
+        return content
+    except Exception as e:
+        logging.error(f"Error downloading file from URL: {url}\n{e}")
+        raise e
 
-def parse_xml_to_csv(xml_path):
-    root = ET.parse(xml_path).getroot()
-    ns = {'ns': 'urn:iso:std:iso:20022:tech:xsd:head.003.001.01'}
-    fininstrms = root.findall(".//ns:FinInstrmGnlAttrbts", ns)
-    with open('output.csv', 'w', newline='') as csvfile:
-        fieldnames = ['FinInstrmGnlAttrbts.Id', 'FinInstrmGnlAttrbts.FullNm',
-                      'FinInstrmGnlAttrbts.ClssfctnTp', 'FinInstrmGnlAttrbts.CmmdtyDerivInd',
-                      'FinInstrmGnlAttrbts.NtnlCcy', 'Issr']
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+def extract_zip(file_content):
+    """Extracts the XML file from the given ZIP file content"""
+    try:
+        with zipfile.ZipFile(io.BytesIO(file_content)) as zip_file:
+            # Find the XML file whose file_type is DLTINS
+            for name in zip_file.namelist():
+                if 'DLTINS' in name and name.endswith('.xml'):
+                    xml_content = zip_file.read(name)
+                    return xml_content
+            logging.error(f"No XML file found in the ZIP file.")
+            raise ValueError("No XML file found in the ZIP file.")
+    except Exception as e:
+        logging.error(f"Error extracting XML from ZIP file.\n{e}")
+        raise e
+
+def parse_xml(xml_content):
+    """Parses the given XML content and returns a list of dictionaries"""
+    try:
+        # Parse the XML content into an ElementTree object
+        root = ET.fromstring(xml_content)
+        
+        # Find the first FinInstrmGnlAttrbts whose file_type is DLTINS
+        for item in root.findall(".//{*}FinInstrmGnlAttrbts"):
+            if item.find("{*}FileTp").text == 'DLTINS':
+                data = {
+                    'FinInstrmGnlAttrbts.Id': item.find("{*}Id").text,
+                    'FinInstrmGnlAttrbts.FullNm': item.find("{*}FullNm").text,
+                    'FinInstrmGnlAttrbts.ClssfctnTp': item.find("{*}ClssfctnTp").text,
+                    'FinInstrmGnlAttrbts.CmmdtyDerivInd': item.find("{*}CmmdtyDerivInd").text,
+                    'FinInstrmGnlAttrbts.NtnlCcy': item.find("{*}NtnlCcy").text,
+                    'Issr': item.find("{*}Issr").text,
+                }
+                return [data]
+        
+        logging.error(f"No FinInstrmGnlAttrbts found in the XML file.")
+        raise ValueError("No FinInstrmGnlAttrbts found in the XML file.")
+    except Exception as e:
+        logging.error(f"Error parsing XML.\n{e}")
+        raise e
+
+# Define function to write data to CSV
+def write_csv(data):
+    csv_file = 'output.csv'
+    with open(csv_file, mode='w', newline='') as file:
+        fieldnames = ['FinInstrmGnlAttrbts.Id', 'FinInstrmGnlAttrbts.FullNm', 'FinInstrmGnlAttrbts.ClssfctnTp', 'FinInstrmGnlAttrbts.CmmdtyDerivInd', 'FinInstrmGnlAttrbts.NtnlCcy', 'Issr']
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
         writer.writeheader()
-        for fininstrm in fininstrms:
-            row = {}
-            row['FinInstrmGnlAttrbts.Id'] = fininstrm.find('ns:Id', ns).text
-            row['FinInstrmGnlAttrbts.FullNm'] = fininstrm.find('ns:FullNm', ns).text
-            row['FinInstrmGnlAttrbts.ClssfctnTp'] = fininstrm.find('ns:ClssfctnTp', ns).text
-            row['FinInstrmGnlAttrbts.CmmdtyDerivInd'] = fininstrm.find('ns:CmmdtyDerivInd', ns).text
-            row['FinInstrmGnlAttrbts.NtnlCcy'] = fininstrm.find('ns:NtnlCcy', ns).text
-            row['Issr'] = fininstrm.find('ns:Issr', ns).text
+        for row in data:
             writer.writerow(row)
-    logger.info('Converted XML to CSV.')
-
-def upload_file_to_s3(file_path, s3_key):
-    s3 = boto3.client('s3')
-    with open(file_path, 'rb') as f:
-        s3.upload_fileobj(f, S3_BUCKET, s3_key)
-    logger.info(f'Uploaded {file_path} to s3://{S3_BUCKET}/{s3_key}')
-
-def lambda_handler(event, context):
-    # Download xml from given URL
-    xml_url = "https://registers.esma.europa.eu/solr/esma_registers_firds_files/select?q=*&fq=publication_date:%5B2021-01-17T00:00:00Z+TO+2021-01-19T23:59:59Z%5D&wt=xml&indent=true&start=0&rows=100"
-    download_xml = requests.get(xml_url)
-
-  # Parse xml to find download link with file_type = DLTINS
-    root = ET.fromstring(download_xml.content)
-    ns = {'ns': 'http://www.sitemaps.org/schemas/sitemap/0.9'}
-    download_link = None
-
-    for url in root.findall('.//ns:url', ns):
-        file_type = url.find('ns:news', ns).find('ns:file_type', ns).text
-        if file_type == 'DLTINS':
-            download_link = url.find('ns:loc', ns).text
-            break
-
-    if download_link is None:
-        raise ValueError("No download link found for file_type = DLTINS in the given XML")
-
-    # Download zip file from the download link
-    zip_file = requests.get(download_link)
-
-    # Extract xml from the zip
-    with zipfile.ZipFile(io.BytesIO(zip_file.content)) as zip_file:
-        xml_filename = [name for name in zip_file.namelist() if name.endswith('.xml')][0]
-        xml_data = zip_file.read(xml_filename)
-
-    # Parse xml to create csv data
-    root = ET.fromstring(xml_data)
-    ns = {'ns': 'urn:iso:std:iso:20022:tech:xsd:head.001.001.01'}
-
-    csv_data = "FinInstrmGnlAttrbts.Id,FinInstrmGnlAttrbts.FullNm,FinInstrmGnlAttrbts.ClssfctnTp,FinInstrmGnlAttrbts.CmmdtyDerivInd,FinInstrmGnlAttrbts.NtnlCcy,Issr\n"
-
-    for instrmt in root.findall('.//ns:FinInstrmGnlAttrbts', ns):
-        instrmt_id = instrmt.find('ns:Id', ns).text
-        full_name = instrmt.find('ns:FullNm', ns).text
-        clssfctn_tp = instrmt.find('ns:ClssfctnTp', ns).text
-        cmmdty_deriv_ind = instrmt.find('ns:CmmdtyDerivInd', ns).text
-        ntnl_ccy = instrmt.find('ns:NtnlCcy', ns).text
-        issr = instrmt.find('ns:Issr', ns).text
-
-        csv_data += f"{instrmt_id},{full_name},{clssfctn_tp},{cmmdty_deriv_ind},{ntnl_ccy},{issr}\n"
-
-    # Write csv data to file
-    with io.StringIO(csv_data) as csv_file:
-        s3 = boto3.client('s3')
-        s3.put_object(Body=csv_file.getvalue().encode('utf-8'), Bucket='saksh-sys', Key='Result.csv')
-
-    return {
-        'statusCode': 200,
-        'body': 'CSV file successfully uploaded to S3'
-    }
+    
+    # Write CSV to S3 bucket
+    s3 = boto3.resource('s3')
+    bucket_name = os.environ.get('S3_BUCKET_NAME')
+    s3.Object(bucket_name, csv_file).upload_file(csv_file)
+    
+    # Remove CSV file from local directory
+    os.remove(csv_file)
